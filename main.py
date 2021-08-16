@@ -10,36 +10,38 @@ import sqlite3
 from sqlite3 import Error
 
 from progress.bar import Bar
+from progress.spinner import Spinner
 
 # SETUP
 def setArgs():
     parser = argparse.ArgumentParser(description='Save Kindle vocabulary to Notion database.')
     parser.add_argument("-w", "--words", help="Parse words only", action="store_true")
     parser.add_argument("-l", "--lookups", help="Parse lookups only", action="store_true")
-    parser.add_argument("-db", "--database", nargs='?', type=str, help="Parse a specific database file")
+    parser.add_argument("-db", "--database", nargs='?', type=str, default="/Volumes/Kindle/system/vocabulary/vocab.db", help="Parse a specific database file")
+    parser.add_argument("-f", "--floor", nargs='?', type=int, const=500, default=0, help="Set starting index for scan")
+    parser.add_argument("-c", "--ceiling", nargs='?', type=int, const=1000, default=2000, help="Set ending index for scan")
+    parser.add_argument("-t", "--test", help="Run testing function instead of main", action="store_true")
 
     return parser.parse_args()
 args = setArgs()
 
 def setPath():
-    KINDLE_PATH = "/Volumes/Kindle/system/vocabulary/vocab.db"
+    #KINDLE_PATH = "/Volumes/Kindle/system/vocabulary/vocab.db"
     ARCHIVE_PATH = f"/Users/{os.getenv('SYSTEM_USER')}/Documents/Kindle_Vocabulary_Builder"
 
-    if args.database:
-        source = args.database
-    else:
-        try:
-            source = KINDLE_PATH
-        except:
-            raise FileNotFoundError("Please either provide a path to a vocabulary database or connect your Kindle.")
     date = datetime.datetime.now().strftime("%Y-%m-%d")
     filename = f"vocab_{date}"
     filepath = f"{ARCHIVE_PATH}/{filename}.db"
-    try:
-        os.system(f'cp {source} {filepath}')
-        print(f"Database from {source} copied to {ARCHIVE_PATH}")
-    except:
+    if os.path.isfile(filepath):
         print(f"Current database found at {ARCHIVE_PATH}")
+    else:
+        try:
+            source = args.database
+            os.system(f'cp {source} {filepath}')
+            print(f"Database from {source} copied to {ARCHIVE_PATH}")
+        except:
+            raise FileNotFoundError("Please either provide a path to a vocabulary database or connect your Kindle.")
+
     return filepath
 db_file = setPath()
 
@@ -120,7 +122,12 @@ def uploadLookup(data):
     row.usage = data['Usage']
     row.book = data['Book']
     row.author = data['Author']
-    row.stem = wordTable.collection.get_rows(search=data['Stem'])[0]
+    stem_entry =  wordTable.collection.get_rows(search=data['Stem'])[0]
+    row.stem = stem_entry
+    stem = stem_entry.word.lower()
+    word = data["Word"].lower()
+    if (word not in stem) and (stem not in word):
+        row.edit_or_review = True
 
 # DATABASE PROCESSING
 WORD_DB = "words"
@@ -136,7 +143,6 @@ def getWord(row):
 
     duplicates = wordTable.collection.get_rows(search=stem)
     if len(duplicates) is 0:
-
         data = searchDictionary(stem)
         try:
             details = parseDefinition(data['meaning'])
@@ -149,27 +155,9 @@ def getWord(row):
 
 lookup_issues = []
 def getLookup(row):
-    word_cur = connection.cursor()
-    book_cur = connection.cursor()
-
     word_key = row[1]
     book_key = row[2]
     usage = row[5]
-    word_cur.execute(f"select * from {WORD_DB} where id=:key", {"key": word_key})
-    for row in word_cur:
-        if str(word_key) is row[0]:
-            word = row[1]
-            stem = row[2]
-        else:
-            lookup_issues.append(usage)
-            word = ""
-            stem = ""
-        break
-    book_cur.execute(f"select * from {BOOK_DB} where id=:key", {"key": book_key})
-    for row in book_cur:
-        book = row[4]
-        author = row[5]
-        break
 
     filter_params = {
         "filters": [
@@ -192,26 +180,47 @@ def getLookup(row):
     for row in result:
         duplicate_count += 1
 
-    author_temp = author.split(", ")
-    author_temp.reverse()
-    author_formatted = " ".join(author_temp)
     if duplicate_count is 0:
+        word_cur = connection.cursor()
+        book_cur = connection.cursor()
+
+        word_cur.execute(f"select * from {WORD_DB} where id=:key", {"key": word_key})
+        for row in word_cur:
+            #print(f'    "{word_key}", "{row[0]}"')
+            if str(row[0]) == str(word_key):
+                word = row[1]
+                stem = row[2]
+            else:
+                lookup_issues.append(usage)
+                return None
+            break
+        book_cur.execute(f"select * from {BOOK_DB} where id=:key", {"key": book_key})
+        for row in book_cur:
+            book = row[4]
+            author = row[5]
+            break
+
+        author_temp = author.split(", ")
+        author_temp.reverse()
+        author_formatted = " ".join(author_temp)
         #print(word)
         entry = {"Word": word, "Stem": stem, "Usage": usage, "Book": book, "Author": author_formatted}
         uploadLookup(entry)
         return entry
+    else:
+        return None
 
-def getData(table, floor = 0, ceiling = 2000, stop =  False):
+def getData(table):
     cur = connection.cursor()
     cur.execute(f'select * from {table}')
 
     results = []
 
-    bar = Bar(f'Processing {table}', max=2000)
-    i = 0
+    bar = Bar(f'Processing {table}', max=args.ceiling - args.floor)
+    count = 0
     for row in cur:
-        i += 1
-        if (i <= ceiling) and (i > floor):
+        count += 1
+        if (count <= args.ceiling) and (count > args.floor):
             if table is "words":
                 result = getWord(row)
             elif table is "lookups":
@@ -221,23 +230,76 @@ def getData(table, floor = 0, ceiling = 2000, stop =  False):
                 break
             if result:
                 results.append(result)
+            bar.next()
         else:
-            if stop:
+            if(count > args.ceiling):
                 break
-        bar.next()
 
     print(results)
     return results
 
-# MAIN
+# MAIN FUNCTIONS
 def main():
-    if args.words and not args.lookups:
+    if not args.words and not args.lookups:
         getData(WORD_DB)
-    elif args.lookups and not args.words:
         getData(LOOKUP_DB)
     else:
-        getData(WORD_DB)
-        getData(LOOKUP_DB)
+        if args.words:
+            getData(WORD_DB)
+        if args.lookups:
+            getData(LOOKUP_DB)
 
-main()
+process_issues = []
+def process(row):
+    row.processed = not row.processed
+    try:
+        stem_entry = row.stem[0]
+        stem = stem_entry.word.lower()
+        word = row.word.lower()
+        if (word not in stem) and (stem not in word):
+            row.edit_or_review = True
+        # print(word)
+    except:
+        row.edit_or_review = True
+        try:
+            process_issues.append({"Word": row, "Detail": row.usage})
+        except:
+            process_issues.append({"Word": row, "Detail": row.primary_definition})
+
+def process_all(table, filter_bool=False):
+    filter_params = filter_params = {
+        "filters": [
+            {
+                "filter": {
+                    "value": {
+                        "type": "exact",
+                        "value": filter_bool
+                    },
+                    "operator": "checkbox_is"
+                },
+                "property": "processed"
+            }
+        ],
+        "operator": "and"
+    }
+
+    query = table.build_query(filter=filter_params)
+
+    result = query.execute()
+    spinner = Spinner('Processing ')
+    while len(result) is not 0:
+        for row in result:
+            process(row)
+            spinner.next()
+        result = query.execute()
+
+def testing():
+    process_all(lookupTable, True)
+    print(process_issues)
+
+# RUN
+if not args.test:
+    main()
+else:
+    testing()
 
